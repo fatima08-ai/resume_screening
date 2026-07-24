@@ -1,0 +1,7 @@
+venv/
+test_env/
+__pycache__/
+*.pyc
+.streamlit/
+sample_cvs/*.pdf
+.env
