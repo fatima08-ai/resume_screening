@@ -52,7 +52,7 @@ resume_screening/
 ### 1. Clone the repository
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/fatima08-ai/resume_screening.git
 cd resume_screening
 ```
 
