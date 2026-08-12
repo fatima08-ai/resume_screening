@@ -2,6 +2,8 @@ venv/
 test_env/
 __pycache__/
 *.pyc
-.streamlit/
+.streamlit/secrets.toml
 sample_cvs/*.pdf
 .env
+screening_data.db
+.browser_id.txt

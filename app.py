@@ -1,127 +1,137 @@
+"""
+app.py — Portfolio Edition
+----------------------------
+AI-Powered Resume Screening & Candidate Ranking System
+Recruiter-facing version with persistent sessions, candidate status
+tracking, private notes, PDF hiring reports, AI interview questions,
+and AI email drafts.
+"""
+
 import streamlit as st
 import os
+import json
+import io
+import pandas as pd
+import plotly.graph_objects as go
+from fpdf import FPDF
 
-from cv_generator import generate_sample_cvs
-from resume_parser import parse_resume, ALL_SKILLS
+from resume_parser import parse_resume, ALL_SKILLS, extract_text_from_pdf
 from ranking_engine import rank_candidates
 from chatbot import get_chatbot_response
+from ui import apply_theme
+from db import (
+    init_db, create_session, get_all_sessions, get_session, delete_session,
+    save_candidate, get_candidates_for_session, update_candidate_status,
+    add_note, get_notes_for_candidate,
+)
+import uuid
+from datetime import datetime, timedelta
+import pathlib
+
+def sanitize_pdf_text(text: str) -> str:
+    """Replace characters the default PDF font can't render."""
+    replacements = {"\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"', "\u2026": "..."}
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
 
 st.set_page_config(
-    page_title="AI Resume Screening System",
-    page_icon="📄",
+    page_title="AI Resume Screening — Recruiter Dashboard",
+    page_icon=":material/description:",
     layout="wide",
 )
 
-st.markdown("""
-<style>
-    .stApp {
-        background-color: #0f1117;
-    }
+init_db()
+apply_theme()
 
-    h1 {
-        color: #ffffff;
-        font-weight: 700;
-    }
+BROWSER_ID_FILE = pathlib.Path(__file__).parent / ".browser_id.txt"
 
-    section[data-testid="stSidebar"] {
-        background-color: #161923;
-        border-right: 1px solid #262b3d;
-    }
+if BROWSER_ID_FILE.exists():
+    browser_id = BROWSER_ID_FILE.read_text().strip()
+else:
+    browser_id = str(uuid.uuid4())
+    BROWSER_ID_FILE.write_text(browser_id)
 
-    section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3 {
-        color: #7c9eff;
-        font-size: 1.05rem;
-        margin-top: 1.2rem;
-    }
-
-    button[kind="primary"] {
-        background-color: #7c9eff;
-        color: #0f1117;
-        font-weight: 600;
-        border: none;
-    }
-    button[kind="primary"]:hover {
-        background-color: #5c7fe0;
-    }
-
-    button[data-baseweb="tab"] {
-        font-size: 1rem;
-        font-weight: 500;
-    }
-
-    .streamlit-expanderHeader {
-        background-color: #1a1d29;
-        border-radius: 8px;
-    }
-
-    div[data-testid="stMetric"] {
-        background-color: #1a1d29;
-        padding: 12px;
-        border-radius: 8px;
-        border: 1px solid #262b3d;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-if "rankings" not in st.session_state:
-    st.session_state.rankings = None
-
+if "active_session_id" not in st.session_state:
+    st.session_state.active_session_id = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-if "candidates_processed" not in st.session_state:
-    st.session_state.candidates_processed = False
+STATUS_OPTIONS = ["New", "Shortlisted", "Interview", "Rejected"]
 
 with st.sidebar:
-    st.header("🔑 Groq API Key")
-    api_key = st.text_input(
-        "Enter Groq API Key",
-        type="password",
-        help="Get a free key at console.groq.com",
-    )
+    st.title(":material/description: Resume Screening")
 
-    st.header("📋 Sample Data")
-    if st.button("Generate Sample CVs"):
-        paths = generate_sample_cvs()
-        st.success(f"Generated {len(paths)} sample CVs in 'sample_cvs/' folder!")
+    existing_sessions = get_all_sessions(browser_id)
 
-    st.header("📤 Upload Resumes")
-    uploaded_files = st.file_uploader(
-        "Upload Resume PDFs",
-        type=["pdf"],
-        accept_multiple_files=True,
-    )
-    if uploaded_files:
-        st.info(f"{len(uploaded_files)} resume(s) uploaded")
+    view_mode = st.radio("View", ["Screen Candidates", "Dashboard (all sessions)"])
+    st.divider()
 
-    st.header("📝 Job Description")
-    default_jd = """Senior AI/ML Engineer
+    if view_mode == "Screen Candidates":
+        if existing_sessions:
+            mode = st.radio("What would you like to do?", ["Start a new session", "Load a past session"])
+        else:
+            mode = "Start a new session"
+            st.caption("No past sessions yet — start your first one below.")
 
-Requirements: 5+ years Python and ML experience, TensorFlow/PyTorch, NLP, Computer Vision, AWS/GCP, Docker, Kubernetes, MLOps. Preferred: RAG systems, FastAPI, PostgreSQL, Team leadership."""
+        st.divider()
 
-    job_description = st.text_area(
-        "Paste Job Description",
-        value=default_jd,
-        height=200,
-    )
+        if mode == "Start a new session":
+            job_title = st.text_input("Job Title", placeholder="e.g. Senior AI/ML Engineer")
+            job_description = st.text_area("Job Description", placeholder="Paste the job description here...", height=180)
+            jd_pdf = st.file_uploader("Or upload JD as PDF", type=["pdf"], key="jd_pdf_uploader")
 
-    jd_pdf = st.file_uploader("Or upload JD as PDF", type=["pdf"], key="jd_pdf_uploader")
+            st.subheader(":material/upload_file: Upload Resumes")
+            uploaded_files = st.file_uploader("Upload Resume PDFs", type=["pdf"], accept_multiple_files=True)
 
-    process_clicked = st.button("🚀 Process & Rank Candidates", type="primary")
-   
-st.title("📄 AI-Powered Resume Screening & Candidate Ranking")
-st.caption("Intelligent HR Assistant with Groq AI Chatbot")
+            st.divider()
+            api_key = st.secrets.get("GROQ_API_KEY", "")
+            process_clicked = st.button("Process & Rank Candidates", icon=":material/rocket_launch:", type="primary")
+        else:
+            session_options = {f"{s['job_title']} — {s['created_at'][:10]}": s['id'] for s in existing_sessions}
+            selected_label = st.selectbox("Select a session", list(session_options.keys()))
+            selected_session_id = session_options[selected_label]
 
-if process_clicked:
+            if st.button("Load Session", icon=":material/folder_open:", type="primary"):
+                st.session_state.active_session_id = selected_session_id
+            confirm_key = f"confirm_delete_{selected_session_id}"
+            if st.session_state.get(confirm_key):
+                st.warning(f"Delete '{selected_label}' and all its candidates? This can't be undone.")
+                col_yes, col_no = st.columns(2)
+                with col_yes:
+                    if st.button("Yes, delete it", icon=":material/delete_forever:", type="primary"):
+                        delete_session(selected_session_id)
+                        st.session_state[confirm_key] = False
+                        if st.session_state.active_session_id == selected_session_id:
+                            st.session_state.active_session_id = None
+                        st.rerun()
+                with col_no:
+                    if st.button("Cancel"):
+                        st.session_state[confirm_key] = False
+                        st.rerun()
+            else:
+                if st.button("Delete Session", icon=":material/delete:"):
+                    st.session_state[confirm_key] = True
+                    st.rerun()
+                    st.session_state.chat_history = []
+
+            api_key = st.secrets.get("GROQ_API_KEY", "")
+            process_clicked = False
+    else:
+        api_key = st.secrets.get("GROQ_API_KEY", "")
+        process_clicked = False
+
+if view_mode == "Screen Candidates" and process_clicked:
     if not uploaded_files:
         st.error("Please upload at least one resume PDF before processing.")
     elif not job_description.strip() and not jd_pdf:
         st.error("Please provide a job description (text or PDF).")
+    elif not job_title.strip():
+        st.error("Please enter a job title.")
     else:
         with st.spinner("Processing resumes..."):
             final_jd = job_description
             if jd_pdf is not None:
-                from resume_parser import extract_text_from_pdf
                 final_jd = extract_text_from_pdf(jd_pdf)
 
             candidates = []
@@ -133,255 +143,372 @@ if process_clicked:
                     st.warning(f"Could not process {file.name}: {e}")
 
             if candidates:
-                rankings = rank_candidates(candidates, final_jd, ALL_SKILLS)
-                st.session_state.rankings = rankings
-                st.session_state.candidates_processed = True
-                st.session_state.chat_history = []  
-                st.success(f"Processed {len(candidates)} candidate(s) successfully!")
+                rankings = rank_candidates(candidates, final_jd, ALL_SKILLS, api_key)
+                sid = create_session(job_title, final_jd, browser_id)
+                for r in rankings:
+                    save_candidate(sid, r)
+
+                st.session_state.active_session_id = sid
+                st.session_state.chat_history = []
+                st.success(f"Processed {len(candidates)} candidate(s) and saved session '{job_title}'!")
+                st.rerun()
             else:
                 st.error("No resumes could be processed. Please check your files.")
 
+if view_mode == "Dashboard (all sessions)":
+    st.title(":material/dashboard: Recruiter Dashboard")
+    st.caption("All job postings and screening activity")
 
-if not st.session_state.candidates_processed:
-    st.info("👋 Upload resumes and provide a job description to get started!")
-else:
-    tab1, tab2, tab3, tab4 = st.tabs(["🏆 Rankings", "👤 Candidates", "💬 AI Chatbot", "⚖️ Compare"])
+    if not existing_sessions:
+        st.info("No sessions yet. Switch to 'Screen Candidates' to start your first one.")
+    else:
+        dash_rows = []
+        for s in existing_sessions:
+            candidates = get_candidates_for_session(s["id"])
+            shortlisted = sum(1 for c in candidates if c["status"] == "Shortlisted")
+            interview = sum(1 for c in candidates if c["status"] == "Interview")
+            rejected = sum(1 for c in candidates if c["status"] == "Rejected")
+            top_score = max([c["overall_score"] for c in candidates], default=0)
 
-    with tab1:
-        st.header("🏆 Candidate Rankings")
+            dash_rows.append({
+                "Job Title": s["job_title"],
+                "Created": s["created_at"][:10],
+                "Candidates": len(candidates),
+                "Top Score": f"{top_score}%",
+                "Shortlisted": shortlisted,
+                "Interview": interview,
+                "Rejected": rejected,
+            })
 
-        rankings = st.session_state.rankings
+        st.table(pd.DataFrame(dash_rows).style.hide(axis="index"))
 
-        import pandas as pd
+if view_mode == "Screen Candidates":
+    st.title(":material/description: AI-Powered Resume Screening & Candidate Ranking")
+    st.caption("Recruiter dashboard, powered by Groq AI")
 
-        df = pd.DataFrame([{
-            "Rank": i,
-            "Candidate": r["name"],
-            "Overall": r["overall"],
-            "Skills": r["skills"],
-            "Experience": r["experience"],
-            "Education": r["education"],
-            "Certifications": r["certifications"],
-            "Projects": r["projects"],
-        } for i, r in enumerate(rankings, start=1)])
+    if not st.session_state.active_session_id:
+        st.info("Start a new session or load a past one from the sidebar to get started!", icon=":material/waving_hand:")
+    else:
+        session = get_session(st.session_state.active_session_id)
+        db_candidates = get_candidates_for_session(st.session_state.active_session_id)
 
-        min_score = st.slider("Filter: minimum overall score (%)", 0, 100, 0)
-        filtered_df = df[df["Overall"] >= min_score]
-
-        def highlight_score(val):
-            if isinstance(val, (int, float)):
-                if val >= 80:
-                    return "background-color: #1e4d2b; color: white"
-                elif val >= 60:
-                    return "background-color: #5c4d1e; color: white"
-                else:
-                    return "background-color: #5c1e1e; color: white"
-            return ""
-
-        styled_df = filtered_df.style.map(highlight_score, subset=["Overall"])
-
-        st.dataframe(styled_df, use_container_width=True, hide_index=True)
-
-        csv_data = filtered_df.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Rankings as CSV",
-            data=csv_data,
-            file_name="candidate_rankings.csv",
-            mime="text/csv",
-        )
-        st.subheader("📊 Score Comparison")
-
-        import plotly.graph_objects as go
-
-        names = [r["name"] for r in rankings]
-        categories = ["skills", "experience", "education", "certifications", "projects"]
-        category_labels = ["Skills", "Experience", "Education", "Certifications", "Projects"]
-
-        fig = go.Figure()
-        for cat, label in zip(categories, category_labels):
-            fig.add_trace(go.Bar(
-                name=label,
-                x=names,
-                y=[r[cat] for r in rankings],
-            ))
-
-        fig.update_layout(
-            barmode="group",
-            yaxis_title="Score (%)",
-            xaxis_title="Candidate",
-            legend_title="Category",
-            height=450,
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-        st.subheader("🎯 Candidate Profile Radar")
-
-        selected_candidate = st.selectbox(
-            "Select a candidate to view their profile radar",
-            options=names,
-        )
-
-        selected_data = next(r for r in rankings if r["name"] == selected_candidate)
-
-        radar_categories = category_labels + [category_labels[0]]  # close the loop
-        radar_values = [selected_data[cat] for cat in categories] + [selected_data[categories[0]]]
-
-        radar_fig = go.Figure()
-        radar_fig.add_trace(go.Scatterpolar(
-            r=radar_values,
-            theta=radar_categories,
-            fill="toself",
-            name=selected_candidate,
-        ))
-
-        radar_fig.update_layout(
-            polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
-            showlegend=False,
-            height=450,
-        )
-
-        st.plotly_chart(radar_fig, use_container_width=True)
-    with tab2:
-        st.header("👤 Candidate Profiles")
-
-        rankings = st.session_state.rankings
-
-        for i, r in enumerate(rankings, start=1):
-            with st.expander(f"{r['name']} — Score: {r['overall']}%"):
-                col1, col2 = st.columns(2)
-
-                with col1:
-                    st.subheader("📧 Contact")
-                    st.write(f"**Email:** {r['email']}")
-
-                    st.subheader("💼 Skills")
-                    st.write(", ".join(r["all_skills"]) if r["all_skills"] else "None listed")
-
-                    st.subheader("🎓 Education")
-                    for edu in r["education_details"]:
-                        st.write(f"- {edu}")
-
-                    st.subheader("🛠️ Experience")
-                    for exp in r["experience_details"]:
-                        st.write(f"- {exp}")
-
-                with col2:
-                    st.subheader("📜 Certifications")
-                    for cert in r["certifications_details"]:
-                        st.write(f"- {cert}")
-
-                    st.subheader("🚀 Projects")
-                    for proj in r["projects_details"]:
-                        st.write(f"- {proj}")
-
-                    st.subheader("✅ Matched Skills (for this JD)")
-                    st.write(", ".join(r["matched_skills"]) if r["matched_skills"] else "None")
-
-                    total_required = len(r["matched_skills"]) + len(r["missing_skills"])
-                    if total_required > 0:
-                        st.subheader("📈 Skill Coverage")
-                        matched_pct = len(r["matched_skills"]) / total_required
-                        st.progress(matched_pct, text=f"{len(r['matched_skills'])} of {total_required} required skills matched ({matched_pct*100:.0f}%)")
-    with tab3:
-        st.header("💬 AI HR Chatbot (Powered by Groq)")
-
-        if not api_key:
-            st.warning("Please enter your Groq API key in the sidebar to use the chatbot.")
+        if not db_candidates:
+            st.warning("This session has no candidates.")
         else:
-            st.success("Chatbot ready! Ask questions about the candidates.")
+            rankings = [c["data"] for c in db_candidates]
+            db_by_name = {c["name"]: c for c in db_candidates}
 
-            st.write("**Quick Questions:**")
-            qcol1, qcol2, qcol3, qcol4 = st.columns(4)
-            quick_question = None
+            st.subheader(f"Job: {session['job_title']}")
 
-            with qcol1:
-                if st.button("Who is the best candidate?"):
-                    quick_question = "Who is the best candidate and why?"
-            with qcol2:
-                if st.button("Compare the candidates"):
-                    quick_question = "Compare all the candidates in detail."
-            with qcol3:
-                if st.button("Who has more experience?"):
-                    quick_question = "Which candidate has the most relevant experience?"
-            with qcol4:
-                if st.button("Recommend the top candidate"):
-                    quick_question = "Give a final recommendation on who to hire."
+            tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                ":material/emoji_events: Rankings",
+                ":material/person: Candidates",
+                ":material/chat: AI Chatbot",
+                ":material/balance: Compare",
+                ":material/summarize: Report",
+            ])
 
-            for msg in st.session_state.chat_history:
-                with st.chat_message(msg["role"]):
-                    st.write(msg["content"])
+            with tab1:
+                st.header(":material/emoji_events: Candidate Rankings")
 
-            user_input = st.chat_input("Ask a question about the candidates...")
+                df = pd.DataFrame([{
+                    "Rank": i,
+                    "Candidate": r["name"],
+                    "Overall": r["overall"],
+                    "Skills": r["skills"],
+                    "Experience": r["experience"],
+                    "Education": r["education"],
+                    "Certifications": r["certifications"],
+                    "Projects": r["projects"],
+                    "Status": db_by_name[r["name"]]["status"],
+                } for i, r in enumerate(rankings, start=1)])
 
-            question_to_ask = quick_question or user_input
+                min_score = st.slider("Filter: minimum overall score (%)", 0, 100, 0)
+                filtered_df = df[df["Overall"] >= min_score]
 
-            if question_to_ask:
-                st.session_state.chat_history.append({"role": "user", "content": question_to_ask})
+                def highlight_score(val):
+                    is_dark = st.session_state.get("theme", "Dark") == "Dark"
+                    if isinstance(val, (int, float)):
+                        if val >= 80:
+                            bg, fg = ("#1e4d2b", "white") if is_dark else ("#c6e6cf", "#1c1c1a")
+                        elif val >= 60:
+                            bg, fg = ("#5c4d1e", "white") if is_dark else ("#f0dfa8", "#1c1c1a")
+                        else:
+                            bg, fg = ("#5c1e1e", "white") if is_dark else ("#f2c6c6", "#1c1c1a")
+                        return f"background-color: {bg}; color: {fg}"
+                    return ""
 
-                with st.spinner("Thinking..."):
-                    answer = get_chatbot_response(
-                        question_to_ask,
-                        st.session_state.rankings,
-                        api_key,
-                        st.session_state.chat_history[:-1],  # history *before* this question
-                    )
+                styled_df = filtered_df.style.format({
+                    "Overall": "{:.1f}%", "Skills": "{:.1f}%", "Experience": "{:.1f}%",
+                    "Education": "{:.1f}%", "Certifications": "{:.1f}%", "Projects": "{:.1f}%",
+                }).map(highlight_score, subset=["Overall"]).hide(axis="index")
+                st.table(styled_df)
 
-                st.session_state.chat_history.append({"role": "assistant", "content": answer})
-                st.rerun()
-    with tab4:
-        st.header("⚖️ Side-by-Side Comparison")
+                excel_buffer = io.BytesIO()
+                with pd.ExcelWriter(excel_buffer, engine="openpyxl") as writer:
+                    filtered_df.to_excel(writer, index=False, sheet_name="Rankings")
+                    worksheet = writer.sheets["Rankings"]
+                    for col_idx, col_name in enumerate(filtered_df.columns, start=1):
+                        max_len = max(
+                            filtered_df[col_name].astype(str).map(len).max(),
+                            len(col_name),
+                        ) + 2
+                        worksheet.column_dimensions[worksheet.cell(row=1, column=col_idx).column_letter].width = max_len
 
-        rankings = st.session_state.rankings
-        candidate_names = [r["name"] for r in rankings]
+                st.download_button("Download Rankings as Excel", data=excel_buffer.getvalue(),
+                                    file_name="candidate_rankings.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    icon=":material/download:")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            candidate_a_name = st.selectbox("Candidate A", candidate_names, index=0, key="compare_a")
-        with col2:
-            default_b = 1 if len(candidate_names) > 1 else 0
-            candidate_b_name = st.selectbox("Candidate B", candidate_names, index=default_b, key="compare_b")
+                st.subheader(":material/bar_chart: Score Comparison")
+                names = [r["name"] for r in rankings]
+                categories = ["skills", "experience", "education", "certifications", "projects"]
+                category_labels = ["Skills", "Experience", "Education", "Certifications", "Projects"]
 
-        candidate_a = next(r for r in rankings if r["name"] == candidate_a_name)
-        candidate_b = next(r for r in rankings if r["name"] == candidate_b_name)
+                fig = go.Figure()
+                for cat, label in zip(categories, category_labels):
+                    fig.add_trace(go.Bar(name=label, x=names, y=[r[cat] for r in rankings]))
 
-        st.subheader("📊 Score Comparison")
+                is_dark = st.session_state.get("theme", "Dark") == "Dark"
+                text_color = "#eceef2" if is_dark else "#1c1c1a"
+                grid_color = "#2a2e3a" if is_dark else "#dcdad3"
+                fig.update_layout(
+                    barmode="group", height=450,
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color=text_color),
+                    legend=dict(title="Category", font=dict(color=text_color)),
+                    xaxis=dict(title=dict(text="Candidate", font=dict(color=text_color)),
+                               tickfont=dict(color=text_color), gridcolor=grid_color, linecolor=grid_color),
+                    yaxis=dict(title=dict(text="Score (%)", font=dict(color=text_color)),
+                               tickfont=dict(color=text_color), gridcolor=grid_color, linecolor=grid_color),
+                )
+                st.plotly_chart(fig, use_container_width=True)
 
-        compare_categories = ["overall", "skills", "experience", "education", "certifications", "projects"]
-        compare_labels = ["Overall", "Skills", "Experience", "Education", "Certifications", "Projects"]
+            with tab2:
+                st.header(":material/person: Candidate Profiles")
 
-        for cat, label in zip(compare_categories, compare_labels):
-            comp_col1, comp_col2, comp_col3 = st.columns([2, 1, 2])
-            val_a = candidate_a[cat]
-            val_b = candidate_b[cat]
+                for r in rankings:
+                    db_row = db_by_name[r["name"]]
+                    expand_key = f"expanded_{db_row['id']}"
+                    if expand_key not in st.session_state:
+                        st.session_state[expand_key] = False
 
-            with comp_col1:
-                st.metric(label=f"{candidate_a_name} — {label}", value=f"{val_a}%")
-            with comp_col2:
-                if val_a > val_b:
-                    st.markdown("<h3 style='text-align: center;'>⬅️</h3>", unsafe_allow_html=True)
-                elif val_b > val_a:
-                    st.markdown("<h3 style='text-align: center;'>➡️</h3>", unsafe_allow_html=True)
+                    with st.expander(f"{r['name']} - Score: {r['overall']}% | Status: {db_row['status']}", expanded=st.session_state[expand_key]):
+                        col1, col2 = st.columns(2)
+
+                        with col1:
+                            st.subheader(":material/mail: Contact")
+                            st.write(f"**Email:** {r['email']}")
+
+                            st.subheader(":material/work: Skills")
+                            st.write(", ".join(r["all_skills"]) if r["all_skills"] else "None listed")
+
+                            st.subheader(":material/school: Education")
+                            for edu in r["education_details"]:
+                                st.write(f"- {edu}")
+
+                            st.subheader(":material/engineering: Experience")
+                            for exp in r["experience_details"]:
+                                st.write(f"- {exp}")
+
+                        with col2:
+                            st.subheader(":material/verified: Certifications")
+                            for cert in r["certifications_details"]:
+                                st.write(f"- {cert}")
+
+                            st.subheader(":material/rocket_launch: Projects")
+                            for proj in r["projects_details"]:
+                                st.write(f"- {proj}")
+
+                        st.divider()
+
+                        st.subheader(":material/label: Status")
+                        current_status = db_row["status"]
+                        new_status = st.selectbox(
+                            "Update status", STATUS_OPTIONS,
+                            index=STATUS_OPTIONS.index(current_status),
+                            key=f"status_{db_row['id']}",
+                        )
+                        if new_status != current_status:
+                            update_candidate_status(db_row["id"], new_status)
+                            st.session_state[expand_key] = True
+                            st.success(f"Status updated to {new_status}")
+                            st.rerun()
+
+                        st.subheader(":material/edit_note: Private Notes")
+                        new_note = st.text_area("Add a note", key=f"note_input_{db_row['id']}", height=80)
+                        if st.button("Save Note", icon=":material/save:", key=f"note_btn_{db_row['id']}"):
+                            if new_note.strip():
+                                add_note(db_row["id"], new_note.strip())
+                                st.session_state[expand_key] = True
+                                st.success("Note saved.")
+                                st.rerun()
+
+                        existing_notes = get_notes_for_candidate(db_row["id"])
+                        for n in existing_notes:
+                            st.caption(f"{n['created_at'][:16]} — {n['note_text']}")
+
+                        st.divider()
+
+                        st.subheader(":material/mic: AI Interview Questions")
+                        if st.button("Generate Interview Questions", icon=":material/auto_awesome:", key=f"iq_{db_row['id']}"):
+                            if not api_key:
+                                st.warning("Enter your Groq API key in the sidebar first.")
+                            else:
+                                with st.spinner("Generating questions..."):
+                                    prompt = (
+                                        f"Generate 5 targeted interview questions for {r['name']}, "
+                                        f"based on their matched skills ({', '.join(r['matched_skills']) or 'none'}) "
+                                        f"and missing skills ({', '.join(r['missing_skills']) or 'none'}) "
+                                        f"relative to this role. Focus on probing their strengths and "
+                                        f"clarifying their gaps."
+                                    )
+                                    answer = get_chatbot_response(prompt, rankings, api_key, [])
+                                    st.write(answer)
+
+                        st.subheader(":material/mail: AI Email Draft")
+                        if st.button("Draft Email", icon=":material/edit:", key=f"email_{db_row['id']}"):
+                            if not api_key:
+                                st.warning("Enter your Groq API key in the sidebar first.")
+                            else:
+                                with st.spinner("Drafting email..."):
+                                    if current_status == "Rejected":
+                                        prompt = f"Write a brief, kind, professional rejection email to {r['name']} for this role."
+                                    elif current_status in ("Shortlisted", "Interview"):
+                                        prompt = f"Write a brief, warm, professional email to {r['name']} inviting them to interview for this role."
+                                    else:
+                                        prompt = f"Write a brief, professional email to {r['name']} acknowledging their application is under review."
+                                    answer = get_chatbot_response(prompt, rankings, api_key, [])
+                                    st.write(answer)
+
+            with tab3:
+                st.header(":material/chat: AI HR Chatbot (Powered by Groq)")
+
+                if not api_key:
+                    st.warning("Please enter your Groq API key in the sidebar to use the chatbot.")
                 else:
-                    st.markdown("<h3 style='text-align: center;'>➖</h3>", unsafe_allow_html=True)
-            with comp_col3:
-                st.metric(label=f"{candidate_b_name} — {label}", value=f"{val_b}%")
+                    st.success("Chatbot ready! Ask questions about the candidates.")
 
-        st.divider()
+                    st.write("**Quick Questions:**")
+                    qcol1, qcol2, qcol3, qcol4 = st.columns(4)
+                    quick_question = None
+                    with qcol1:
+                        if st.button("Who is the best candidate?"):
+                            quick_question = "Who is the best candidate and why?"
+                    with qcol2:
+                        if st.button("Compare the candidates"):
+                            quick_question = "Compare all the candidates in detail."
+                    with qcol3:
+                        if st.button("Who has more experience?"):
+                            quick_question = "Which candidate has the most relevant experience?"
+                    with qcol4:
+                        if st.button("Recommend the top candidate"):
+                            quick_question = "Give a final recommendation on who to hire."
 
-        st.subheader("💼 Skills Comparison")
-        skills_a = set(candidate_a["all_skills"])
-        skills_b = set(candidate_b["all_skills"])
+                    for msg in st.session_state.chat_history:
+                        with st.chat_message(msg["role"]):
+                            st.write(msg["content"])
 
-        sc1, sc2, sc3 = st.columns(3)
-        with sc1:
-            st.write(f"**Only {candidate_a_name} has:**")
-            unique_a = skills_a - skills_b
-            st.write(", ".join(unique_a) if unique_a else "None")
-        with sc2:
-            st.write("**Both have:**")
-            shared = skills_a.intersection(skills_b)
-            st.write(", ".join(shared) if shared else "None")
-        with sc3:
-            st.write(f"**Only {candidate_b_name} has:**")
-            unique_b = skills_b - skills_a
-            st.write(", ".join(unique_b) if unique_b else "None")
+                    user_input = st.chat_input("Ask a question about the candidates...")
+                    question_to_ask = quick_question or user_input
+
+                    if question_to_ask:
+                        st.session_state.chat_history.append({"role": "user", "content": question_to_ask})
+                        with st.spinner("Thinking..."):
+                            answer = get_chatbot_response(
+                                question_to_ask, rankings, api_key,
+                                st.session_state.chat_history[:-1],
+                            )
+                        st.session_state.chat_history.append({"role": "assistant", "content": answer})
+                        st.rerun()
+
+            with tab4:
+                st.header(":material/balance: Side-by-Side Comparison")
+
+                candidate_names = [r["name"] for r in rankings]
+                col1, col2 = st.columns(2)
+                with col1:
+                    candidate_a_name = st.selectbox("Candidate A", candidate_names, index=0, key="compare_a")
+                with col2:
+                    default_b = 1 if len(candidate_names) > 1 else 0
+                    candidate_b_name = st.selectbox("Candidate B", candidate_names, index=default_b, key="compare_b")
+
+                candidate_a = next(r for r in rankings if r["name"] == candidate_a_name)
+                candidate_b = next(r for r in rankings if r["name"] == candidate_b_name)
+
+                st.subheader(":material/bar_chart: Score Comparison")
+                compare_categories = ["overall", "skills", "experience", "education", "certifications", "projects"]
+                compare_labels = ["Overall", "Skills", "Experience", "Education", "Certifications", "Projects"]
+
+                for cat, label in zip(compare_categories, compare_labels):
+                    comp_col1, comp_col2, comp_col3 = st.columns([2, 1, 2])
+                    val_a, val_b = candidate_a[cat], candidate_b[cat]
+                    with comp_col1:
+                        st.metric(label=f"{candidate_a_name} — {label}", value=f"{val_a}%")
+                    with comp_col2:
+                        if val_a > val_b:
+                            arrow = "←"
+                        elif val_b > val_a:
+                            arrow = "→"
+                        else:
+                            arrow = "−"
+                        st.markdown(f"<div style='text-align: center; padding-top: 14px; font-size: 22px;'>{arrow}</div>", unsafe_allow_html=True)
+                    with comp_col3:
+                        st.metric(label=f"{candidate_b_name} — {label}", value=f"{val_b}%")
+
+                st.divider()
+                st.subheader(":material/work: Skills Comparison")
+                skills_a, skills_b = set(candidate_a["all_skills"]), set(candidate_b["all_skills"])
+                sc1, sc2, sc3 = st.columns(3)
+                with sc1:
+                    st.write(f"**Only {candidate_a_name} has:**")
+                    st.write(", ".join(skills_a - skills_b) or "None")
+                with sc2:
+                    st.write("**Both have:**")
+                    st.write(", ".join(skills_a & skills_b) or "None")
+                with sc3:
+                    st.write(f"**Only {candidate_b_name} has:**")
+                    st.write(", ".join(skills_b - skills_a) or "None")
+
+            with tab5:
+                st.header(":material/summarize: Downloadable Hiring Report")
+                st.caption("A formatted PDF summary of this session's rankings, ready to share with a hiring manager.")
+
+                if st.button("Generate PDF Report", icon=":material/picture_as_pdf:", type="primary"):
+                    pdf = FPDF()
+                    pdf.add_page()
+                    pdf.set_font("Helvetica", "B", 18)
+                    pdf.cell(0, 12, "Candidate Ranking Report", new_x="LMARGIN", new_y="NEXT")
+                    pdf.set_font("Helvetica", "", 11)
+                    pdf.cell(0, 8, f"Job: {session['job_title']}", new_x="LMARGIN", new_y="NEXT")
+                    pdf.cell(0, 8, f"Generated: {session['created_at'][:10]}", new_x="LMARGIN", new_y="NEXT")
+                    pdf.ln(6)
+
+                    for i, r in enumerate(rankings, start=1):
+                        db_row = db_by_name[r["name"]]
+                        pdf.set_font("Helvetica", "B", 13)
+                        pdf.set_x(pdf.l_margin)
+                        pdf.cell(0, 8, sanitize_pdf_text(f"{i}. {r['name']} - {r['overall']}% ({db_row['status']})"), new_x="LMARGIN", new_y="NEXT")
+                        pdf.set_font("Helvetica", "", 10)
+
+                        pdf.set_x(pdf.l_margin)
+                        pdf.multi_cell(0, 6,
+                            f"Skills: {r['skills']}%  Experience: {r['experience']}%  "
+                            f"Education: {r['education']}%  Certs: {r['certifications']}%  Projects: {r['projects']}%")
+
+                        pdf.set_x(pdf.l_margin)
+                        pdf.multi_cell(0, 6, f"Matched skills: {', '.join(r['matched_skills']) or 'None'}")
+
+                        pdf.set_x(pdf.l_margin)
+                        pdf.multi_cell(0, 6, f"Missing skills: {', '.join(r['missing_skills']) or 'None'}")
+                        pdf.ln(4)
+
+                    pdf_bytes = bytes(pdf.output())
+                    st.download_button(
+                        "Download Report PDF",
+                        data=pdf_bytes,
+                        file_name=f"hiring_report_{session['job_title'].replace(' ', '_')}.pdf",
+                        mime="application/pdf",
+                        icon=":material/download:",
+                    )
