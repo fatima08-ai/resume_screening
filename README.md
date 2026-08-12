@@ -69,6 +69,7 @@ resume_screening_portfolio/
 ### 1. Clone the repository
 
 ```bash
+git clone https://github.com/fatima08-ai/resume_screening
 cd resume_screening
 ```
 
