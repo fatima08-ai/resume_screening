@@ -122,7 +122,6 @@ Each candidate's overall score is a weighted combination of five sub-scores. Ski
 
 ## Limitations
 
-<<<<<<< HEAD
 These weights and heuristics are intentionally simple and explainable rather than opaque, so every ranking decision the system makes can be traced back to a specific, human-readable reason.
 
 ## Known Design Decisions
@@ -137,4 +136,3 @@ Fatima Jawad — ML & AI Internship, Teerop Pvt Ltd
 - **Session isolation is per-installation, not per-user or per-browser.** Each local copy of this app tracks its own sessions independently, using a local ID file rather than login. If multiple people run the app from the same cloned folder on a shared computer, they'll see each other's sessions; separate clones (or separate machines) stay fully isolated. This is a deliberate scope decision for a no-login local tool — proper multi-user isolation on a shared hosted deployment would require a real authentication system.
 - **Scanned/image-only PDFs aren't supported** — parsing requires an actual text layer; OCR is out of scope for this version.
 - **Highly unconventional resume layouts** (three-plus columns, heavy sidebar designs) may not parse cleanly. Standard single-column and common two-column layouts are well supported.
->>>>>>> 38bb1ec (Added UI theme system, AI-powered candidate scoring, session persistence, and recruiter workflow tools)
